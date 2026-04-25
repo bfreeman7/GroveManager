@@ -1,0 +1,15 @@
+[Unit]
+Description=OrchardMonitor - measurements and Open Sprinkler schedule
+After=network.target
+
+[Service]
+Type=simple
+User=bfree
+WorkingDirectory=/home/bfree/Repos/OrchardMonitor
+Environment=DATA_STORAGE_PATH=/home/bfree/Repos/OrchardMonitor/data
+# Optional: EnvironmentFile=/etc/orchardmonitor.env for OPENSPRINKLER_URL, OPENSPRINKLER_PASSWORD
+ExecStart=/home/bfree/Repos/OrchardMonitor/venv/bin/python src/server.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
