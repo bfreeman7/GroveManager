@@ -2,3 +2,6 @@ Flask>=2.3.0
 requests>=2.31.0
 pandas>=2.0.0
 pyarrow>=12.0.0
+pytest>=8.0.0
+# Pin to a known-good SDK release; newer versions have shown TLS handshake issues on some hosts.
+sift-stack-py[sift-stream]==0.10.1

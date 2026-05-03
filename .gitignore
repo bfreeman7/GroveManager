@@ -9,6 +9,16 @@ venv/
 # Local data (do not commit)
 data/
 *.parquet
+
+# Local env overlays (do not commit)
+env/**
+!env/_example/**
 # Editor
 .vscode/
 .idea/
+
+# UI
+node_modules/
+dist/
+.npm/
+.pnpm-store/

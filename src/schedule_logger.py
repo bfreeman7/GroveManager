@@ -74,9 +74,15 @@ class ScheduleLogger:
 
     def run_every_12h(self):
         """Background loop: log schedule immediately, then every 12 hours until stopped."""
-        self.log_schedule()
-        while not self._stop.wait(12 * 60 * 60):  # 12 hours
+        try:
             self.log_schedule()
+        except Exception:
+            logger.error("Schedule logger initial log_schedule failed", exc_info=True)
+        while not self._stop.wait(12 * 60 * 60):  # 12 hours
+            try:
+                self.log_schedule()
+            except Exception:
+                logger.error("Schedule logger periodic log_schedule failed", exc_info=True)
 
     def start_background(self):
         """Start the 12-hour polling loop in a daemon thread."""
