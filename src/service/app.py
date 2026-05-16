@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -12,6 +11,11 @@ from flask import Flask, Response, request
 from libs.edge_db import EdgeDB
 from libs.forwarder import BackgroundForwardLoop, FakeSiftForwarder, ForwardWorker, SiftSDKForwarder
 from libs.measurement_store import MeasurementStore
+from libs.opensprinkler_client import (
+    OpenSprinklerClient,
+    summarize_json_all,
+    summarize_run_log,
+)
 from schedule_logger import ScheduleLogger, log_schedule_update
 
 
@@ -101,6 +105,9 @@ def create_app() -> Flask:
     data_path = os.getenv("DATA_STORAGE_PATH", "data")
     opensprinkler_url = os.getenv("OPENSPRINKLER_URL", "")
     opensprinkler_password = os.getenv("OPENSPRINKLER_PASSWORD", "")
+    opensprinkler_pw_md5 = os.getenv("OPENSPRINKLER_PW_MD5", "") or os.getenv(
+        "OPENSPRINKLER_PASSWORD_MD5", ""
+    )
     edge_db_path = os.getenv("EDGE_DB_PATH", os.path.join(data_path, "edge.db"))
     sift_mode = os.getenv("SIFT_MODE", "fake").strip().lower()  # fake|sdk
     sift_asset = os.getenv("SIFT_ASSET") or os.getenv("SIFT_ASSET_NAME", "orchard-main")
@@ -111,10 +118,17 @@ def create_app() -> Flask:
     edge_db = EdgeDB(path=edge_db_path)
 
     schedule_logger: Optional[ScheduleLogger] = None
-    if opensprinkler_url and opensprinkler_password:
+    opensprinkler_client: Optional[OpenSprinklerClient] = None
+    if opensprinkler_url and (opensprinkler_password or opensprinkler_pw_md5):
+        opensprinkler_client = OpenSprinklerClient(
+            base_url=opensprinkler_url,
+            password=opensprinkler_password,
+            password_md5=opensprinkler_pw_md5,
+        )
         schedule_logger = ScheduleLogger(
             base_url=opensprinkler_url,
             password=opensprinkler_password,
+            password_md5=opensprinkler_pw_md5,
             base_path=data_path,
         )
     else:
@@ -128,7 +142,11 @@ def create_app() -> Flask:
         return ForwardWorker(db=edge_db, forwarder=forwarder, asset=sift_asset)
 
     forward_worker = _make_forward_worker()
-    forward_loop = BackgroundForwardLoop(worker=forward_worker, interval_seconds=forward_interval_seconds)
+    forward_loop = BackgroundForwardLoop(
+        worker=forward_worker,
+        db=edge_db,
+        interval_seconds=forward_interval_seconds,
+    )
 
     @app.route("/ecowitt", methods=["POST"])
     def ecowitt_listener():
@@ -194,25 +212,34 @@ def create_app() -> Flask:
 
     @app.route("/admin/forward/run-once", methods=["POST"])
     def admin_forward_run_once():
-        res = forward_worker.run_once()
+        batch_size = request.args.get("batch_size", type=int)
+        res = forward_worker.run_once(batch_size=batch_size)
         return {"attempted": res.attempted, "forwarded": res.forwarded, "error": res.error}, 200
 
-    def _opensprinkler_update(params: dict) -> dict:
-        pw = hashlib.md5(opensprinkler_password.encode()).hexdigest()
-        all_params = {"pw": pw, **params}
-        url = f"{opensprinkler_url.rstrip('/')}/cp"
-        r = requests.get(url, params=all_params, timeout=10)
-        r.raise_for_status()
-        return r.json()
+    @app.route("/admin/forward/catchup", methods=["POST"])
+    def admin_forward_catchup():
+        """Drain backlog with large gRPC streams (bounded by env/time/query)."""
+        max_batches = request.args.get("max_batches", type=int)
+        max_seconds = request.args.get("max_seconds", type=float)
+        batch_size = request.args.get("batch_size", type=int)
+        # Default 5 minutes per HTTP call unless caller passes max_seconds=0 (unlimited).
+        if max_batches is None and max_seconds is None:
+            max_seconds = 300.0
+        summary = forward_worker.run_catchup(
+            max_batches=max_batches,
+            max_seconds=max_seconds,
+            batch_size=batch_size,
+        )
+        return summary, 200
 
     @app.route("/schedule/update", methods=["POST"])
     def schedule_update():
-        if not schedule_logger:
+        if not schedule_logger or not opensprinkler_client:
             return {"error": "Open Sprinkler not configured"}, 503
 
         try:
             body = request.get_json() or {}
-            resp = _opensprinkler_update(body)
+            resp = opensprinkler_client.change_program(body)
 
             log_schedule_update(data_path, request_data=body, response_data=resp)
             schedule_logger.log_schedule()
@@ -227,6 +254,149 @@ def create_app() -> Flask:
             )
             return {"error": str(e)}, 500
 
+    @app.route("/integrations/opensprinkler/snapshot", methods=["GET"])
+    def opensprinkler_snapshot():
+        if not opensprinkler_client:
+            return {"configured": False}, 200
+        try:
+            raw = opensprinkler_client.get_json_all()
+            summary = summarize_json_all(raw)
+            return {
+                "configured": True,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "summary": summary,
+                "raw": raw,
+            }, 200
+        except requests.RequestException as e:
+            logger.error("Open Sprinkler snapshot failed: %s", e, exc_info=True)
+            return {"error": f"Open Sprinkler request failed: {e}"}, 502
+        except (TypeError, ValueError) as e:
+            logger.error("Open Sprinkler snapshot parse failed: %s", e, exc_info=True)
+            return {"error": f"Invalid response from Open Sprinkler: {e}"}, 502
+
+    @app.route("/integrations/opensprinkler/station", methods=["POST"])
+    def opensprinkler_station_manual():
+        """Manual run/stop one station (proxies Open Sprinkler /cm)."""
+        if not opensprinkler_client:
+            return {"error": "Open Sprinkler not configured"}, 503
+
+        body = request.get_json(silent=True) or {}
+        sid_raw = body.get("sid")
+        en_raw = body.get("en")
+
+        if not isinstance(sid_raw, int) or isinstance(sid_raw, bool) or sid_raw < 0:
+            return {"error": "sid must be a non-negative integer"}, 400
+        if en_raw not in (0, 1):
+            return {"error": "en must be 0 (stop) or 1 (run)"}, 400
+
+        sid = int(sid_raw)
+        en = int(en_raw)
+
+        t_val: Optional[int] = None
+        if en == 1:
+            t_raw = body.get("t", 300)
+            if not isinstance(t_raw, int) or isinstance(t_raw, bool):
+                return {"error": "t must be an integer (seconds) when en=1"}, 400
+            if t_raw < 1 or t_raw > 64800:
+                return {"error": "t must be between 1 and 64800 seconds when en=1"}, 400
+            t_val = t_raw
+
+        qo: Optional[int] = None
+        ssta: Optional[int] = None
+        if body.get("qo") is not None:
+            qo_raw = body["qo"]
+            if not isinstance(qo_raw, int) or isinstance(qo_raw, bool):
+                return {"error": "qo must be an integer if provided"}, 400
+            qo = int(qo_raw)
+        if body.get("ssta") is not None:
+            ssta_raw = body["ssta"]
+            if not isinstance(ssta_raw, int) or isinstance(ssta_raw, bool):
+                return {"error": "ssta must be an integer if provided"}, 400
+            ssta = int(ssta_raw)
+
+        try:
+            resp = opensprinkler_client.manual_station(
+                sid=sid,
+                en=en,
+                t=t_val,
+                qo=qo,
+                ssta=ssta,
+            )
+        except requests.RequestException as e:
+            logger.error("Open Sprinkler manual station failed: %s", e, exc_info=True)
+            return {"error": f"Open Sprinkler request failed: {e}"}, 502
+
+        try:
+            code = int(resp.get("result", 1))
+        except (TypeError, ValueError):
+            code = 1
+        if code != 1:
+            return {
+                "error": f"Open Sprinkler declined the command (result={code})",
+                "result": code,
+                "response": resp,
+            }, 400
+        return {"result": code, "response": resp}, 200
+
+    @app.route("/integrations/opensprinkler/log", methods=["GET"])
+    def opensprinkler_log():
+        """Run history from device /jl (not /jn; that endpoint is station names)."""
+        if not opensprinkler_client:
+            return {"error": "Open Sprinkler not configured"}, 503
+
+        hist = request.args.get("hist", default=7, type=int)
+        if hist is None or hist < 0 or hist > 365:
+            return {"error": "hist must be between 0 and 365"}, 400
+
+        try:
+            raw = opensprinkler_client.get_json_all()
+            summary = summarize_json_all(raw)
+            records = opensprinkler_client.get_run_log(hist=hist)
+            station_names = [s["name"] for s in summary["stations"]]
+            program_names = [p["name"] for p in summary["programs"]]
+            runs = summarize_run_log(records, station_names, program_names)
+            return {
+                "hist_days": hist,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "runs": runs,
+            }, 200
+        except requests.RequestException as e:
+            logger.error("Open Sprinkler log failed: %s", e, exc_info=True)
+            return {"error": f"Open Sprinkler request failed: {e}"}, 502
+        except (TypeError, ValueError) as e:
+            logger.error("Open Sprinkler log parse failed: %s", e, exc_info=True)
+            return {"error": f"Invalid response from Open Sprinkler: {e}"}, 502
+
+    @app.route("/integrations/opensprinkler/logging", methods=["POST"])
+    def opensprinkler_logging():
+        """Enable or disable run history logging on the device (proxies /co?lg=)."""
+        if not opensprinkler_client:
+            return {"error": "Open Sprinkler not configured"}, 503
+
+        body = request.get_json(silent=True) or {}
+        lg_raw = body.get("lg")
+        if lg_raw not in (0, 1):
+            return {"error": "lg must be 0 (off) or 1 (on)"}, 400
+        lg = int(lg_raw)
+
+        try:
+            resp = opensprinkler_client.set_logging_enabled(lg)
+        except requests.RequestException as e:
+            logger.error("Open Sprinkler logging toggle failed: %s", e, exc_info=True)
+            return {"error": f"Open Sprinkler request failed: {e}"}, 502
+
+        try:
+            code = int(resp.get("result", 1))
+        except (TypeError, ValueError):
+            code = 1
+        if code != 1:
+            return {
+                "error": f"Open Sprinkler declined the command (result={code})",
+                "result": code,
+                "response": resp,
+            }, 400
+        return {"lg": lg, "result": code, "response": resp}, 200
+
     # Expose runtime wiring for the entrypoint (systemd) to start background threads.
     # Tests import `server.app` and should not start background loops implicitly.
     app.extensions["orchardmonitor"] = {
@@ -236,6 +406,7 @@ def create_app() -> Flask:
         "sift_mode": sift_mode,
         "sift_asset": sift_asset,
         "schedule_logger": schedule_logger,
+        "opensprinkler_client": opensprinkler_client,
         "forward_loop": forward_loop,
     }
 

@@ -1,4 +1,13 @@
-import type { ForwardOnceResponse, StatusResponse } from "./types";
+import type {
+  ForwardOnceResponse,
+  OpenSprinklerLogResponse,
+  OpenSprinklerLoggingBody,
+  OpenSprinklerLoggingResponse,
+  OpenSprinklerSnapshotResponse,
+  OpenSprinklerStationManualBody,
+  OpenSprinklerStationManualResponse,
+  StatusResponse,
+} from "./types";
 
 function apiBase(): string {
   // Examples:
@@ -31,6 +40,34 @@ export async function getStatus(): Promise<StatusResponse> {
 
 export async function forwardRunOnce(): Promise<ForwardOnceResponse> {
   return fetchJson<ForwardOnceResponse>("/admin/forward/run-once", { method: "POST" });
+}
+
+export async function getOpenSprinklerSnapshot(): Promise<OpenSprinklerSnapshotResponse> {
+  return fetchJson<OpenSprinklerSnapshotResponse>("/integrations/opensprinkler/snapshot");
+}
+
+export async function postOpenSprinklerStation(
+  body: OpenSprinklerStationManualBody,
+): Promise<OpenSprinklerStationManualResponse> {
+  return fetchJson<OpenSprinklerStationManualResponse>("/integrations/opensprinkler/station", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getOpenSprinklerLog(histDays = 7): Promise<OpenSprinklerLogResponse> {
+  return fetchJson<OpenSprinklerLogResponse>(
+    `/integrations/opensprinkler/log?hist=${encodeURIComponent(String(histDays))}`,
+  );
+}
+
+export async function postOpenSprinklerLogging(
+  body: OpenSprinklerLoggingBody,
+): Promise<OpenSprinklerLoggingResponse> {
+  return fetchJson<OpenSprinklerLoggingResponse>("/integrations/opensprinkler/logging", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 export function edgeApiBaseForDisplay(): string {

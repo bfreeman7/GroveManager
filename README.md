@@ -51,7 +51,8 @@ ENV_NAME=<your-env> ./scripts/deploy_remote.sh <user>@<host> <remote_repo_path>
 | POST | `/ecowitt` | Ecowitt form-encoded telemetry ingest |
 | GET | `/health` | Liveness + forward queue depth |
 | GET | `/status` | Config + counts + recent events |
-| POST | `/admin/forward/run-once` | Trigger one forward batch |
+| POST | `/admin/forward/run-once` | Trigger one forward batch (`?batch_size=` optional) |
+| POST | `/admin/forward/catchup` | Drain backlog via large gRPC streams (`?max_seconds=`, `?batch_size=`) |
 | POST | `/schedule/update` | (Optional) Open Sprinkler schedule update |
 
 ## More detail

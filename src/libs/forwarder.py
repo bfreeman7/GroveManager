@@ -4,9 +4,10 @@ import asyncio
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
 
 import logging
@@ -65,6 +66,50 @@ def _normalize_sift_grpc_url(url: str) -> str:
         return u[: -len(":443")]
 
     return u
+
+
+def _coalesce_points_by_timestamp(points: List[Dict]) -> List[Dict[str, Any]]:
+    """
+    Merge per-channel rows that share a timestamp into one ingest payload per ts.
+
+    Ecowitt readings produce ~14 sqlite rows per event; coalescing cuts gRPC calls
+    by that factor during catch-up.
+    """
+    by_ts: Dict[str, Dict[str, float]] = {}
+    for p in points:
+        ts = str(p["ts"])
+        ch = str(p["channel"])
+        by_ts.setdefault(ts, {})[ch] = float(p["value"])
+    return [{"ts": ts, "values": vals} for ts, vals in sorted(by_ts.items())]
+
+
+def _split_points_by_day(points: List[Dict]) -> Dict[str, List[Dict]]:
+    by_day: Dict[str, List[Dict]] = {}
+    for p in points:
+        day = str(p["ts"])[:10]
+        by_day.setdefault(day, []).append(p)
+    return by_day
+
+
+def _parse_point_timestamp(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return max(1, int(raw))
+
+
+def forward_batch_size_for_pending(pending: int) -> int:
+    """Larger sqlite pull + one gRPC stream when the queue is deep."""
+    normal = _env_int("FORWARD_BATCH_SIZE", 500)
+    catchup = _env_int("FORWARD_CATCHUP_BATCH_SIZE", 10000)
+    threshold = _env_int("FORWARD_CATCHUP_THRESHOLD", 2000)
+    if pending >= threshold:
+        return catchup
+    return normal
 
 
 def _normalize_sift_py_grpc_uri(url: str) -> str:
@@ -140,10 +185,51 @@ class SiftSDKForwarder(MeasurementForwarder):
                 "Missing Sift config. Set SIFT_API_KEY and SIFT_GRPC_URL (or use SIFT_MODE=fake)."
             )
 
+        self._sift_client = None
+        self._sift_client_lock = threading.Lock()
+        # After sift_client TLS/connect failures on this host, stick to sift_py for the process.
+        self._use_sift_py_only = self.prefer_client == "py"
+
+    def _sift_client_grpc_url(self) -> str:
+        grpc_u = self.grpc_url
+        if "://" not in grpc_u:
+            grpc_u = f"https://{grpc_u}"
+        return grpc_u
+
+    def _get_sift_client(self):
+        """
+        Reuse one SiftClient for the process lifetime.
+
+        Each SiftClient() constructs a GrpcClient with its own background thread and
+        asyncio loop; creating one per forward tick leaks threads until the process exits.
+        """
+        if self._sift_client is not None:
+            return self._sift_client
+        with self._sift_client_lock:
+            if self._sift_client is not None:
+                return self._sift_client
+            from sift_client import SiftClient  # type: ignore
+
+            if not self.rest_url:
+                raise RuntimeError("Missing SIFT_REST_URL required by sift_client.")
+            self._sift_client = SiftClient(
+                api_key=self.api_key,
+                grpc_url=self._sift_client_grpc_url(),
+                rest_url=self.rest_url,
+            )
+            return self._sift_client
+
     def send(self, *, asset: str, day: str, points: List[Dict]) -> None:
         if self.debug:
             logger.setLevel(logging.DEBUG)
 
+        if not points:
+            return
+
+        for day_part, day_points in _split_points_by_day(points).items():
+            self._send_day(asset=asset, day=day_part, points=day_points)
+
+    def _send_day(self, *, asset: str, day: str, points: List[Dict]) -> None:
         channels: Set[str] = set()
         for p in points:
             ch = p.get("channel")
@@ -153,11 +239,11 @@ class SiftSDKForwarder(MeasurementForwarder):
         if not channels:
             return
 
+        coalesced = _coalesce_points_by_timestamp(points)
         client_key = f"{self.base_client_key}.ch{len(channels)}"
         run_name = f"{asset}.{day}"
 
         def _send_via_sift_client() -> None:
-            from sift_client import SiftClient  # type: ignore
             from sift_client.sift_types.channel import ChannelDataType  # type: ignore
             from sift_client.sift_types.ingestion import (  # type: ignore
                 ChannelConfig,
@@ -165,12 +251,8 @@ class SiftSDKForwarder(MeasurementForwarder):
                 IngestionConfigCreate,
             )
 
-            grpc_u = self.grpc_url
-            if "://" not in grpc_u:
-                grpc_u = f"https://{grpc_u}"
-
-            if not self.rest_url:
-                raise RuntimeError("Missing SIFT_REST_URL required by sift_client.")
+            grpc_u = self._sift_client_grpc_url()
+            client = self._get_sift_client()
 
             if self.debug:
                 safe_key = (self.api_key[:6] + "…" + self.api_key[-4:]) if self.api_key else "(missing)"
@@ -195,7 +277,6 @@ class SiftSDKForwarder(MeasurementForwarder):
                 ],
             )
             ingestion_cfg = IngestionConfigCreate(asset_name=asset, client_key=client_key, flows=[flow_cfg])
-            client = SiftClient(api_key=self.api_key, grpc_url=grpc_u, rest_url=self.rest_url)
 
             async def _send_all():
                 ing = await client.async_.ingestion.create_ingestion_config_streaming_client(
@@ -203,9 +284,9 @@ class SiftSDKForwarder(MeasurementForwarder):
                     run=run_name,
                 )
                 async with ing:
-                    for p in points:
-                        ts = datetime.fromisoformat(p["ts"].replace("Z", "+00:00"))
-                        await ing.send(flow_cfg.as_flow(timestamp=ts, values={p["channel"]: float(p["value"])}))
+                    for row in coalesced:
+                        ts = _parse_point_timestamp(row["ts"])
+                        await ing.send(flow_cfg.as_flow(timestamp=ts, values=row["values"]))
                     await ing.finish()
 
             _run_coroutine_sync(_send_all())
@@ -239,12 +320,13 @@ class SiftSDKForwarder(MeasurementForwarder):
             with use_sift_channel(sift_channel_config) as channel:
                 ingestion_service = IngestionService(channel, telemetry_config)
                 ingestion_service.attach_run(channel, run_name)
-                for p in points:
-                    ts = datetime.fromisoformat(p["ts"].replace("Z", "+00:00"))
+                for row in coalesced:
+                    ts = _parse_point_timestamp(row["ts"])
                     values = [IngestWithConfigDataChannelValue(empty=Empty()) for _ in ordered_channels]
-                    idx = channel_idx.get(str(p["channel"]))
-                    if idx is not None:
-                        values[idx] = IngestWithConfigDataChannelValue(double=float(p["value"]))
+                    for ch, val in row["values"].items():
+                        idx = channel_idx.get(ch)
+                        if idx is not None:
+                            values[idx] = IngestWithConfigDataChannelValue(double=val)
                     ingestion_service.ingest_flows(
                         {
                             "flow_name": self.flow_name,
@@ -253,7 +335,7 @@ class SiftSDKForwarder(MeasurementForwarder):
                         }
                     )
 
-        if self.prefer_client == "py":
+        if self._use_sift_py_only:
             _send_via_sift_py()
             return
 
@@ -262,9 +344,10 @@ class SiftSDKForwarder(MeasurementForwarder):
         except Exception as e:
             msg = str(e)
             if "BadSignature" in msg or "InvalidUri" in msg:
+                self._use_sift_py_only = True
                 logger.warning(
-                    "sift_client transport failed (%s). Falling back to deprecated sift_py transport. "
-                    "To force one or the other set SIFT_SDK_PREFER=client|py.",
+                    "sift_client transport failed (%s). Using sift_py for this process. "
+                    "Set SIFT_SDK_PREFER=client|py to override.",
                     msg,
                 )
                 if self.debug:
@@ -281,16 +364,26 @@ class ForwardWorker:
         db: EdgeDB,
         forwarder: MeasurementForwarder,
         asset: str,
-        batch_size: int = 500,
+        batch_size: Optional[int] = None,
     ):
         self.db = db
         self.forwarder = forwarder
         self.asset = asset
-        self.batch_size = batch_size
+        self.batch_size = batch_size or _env_int("FORWARD_BATCH_SIZE", 500)
 
-    def run_once(self) -> ForwardResult:
+    def _resolve_batch_size(self, override: Optional[int] = None) -> int:
+        if override is not None:
+            return max(1, override)
         try:
-            pending = self.db.get_pending_measurements(limit=self.batch_size)
+            pending = self.db.counts()["pending_forward"]
+        except Exception:
+            pending = 0
+        return forward_batch_size_for_pending(pending)
+
+    def run_once(self, *, batch_size: Optional[int] = None) -> ForwardResult:
+        limit = self._resolve_batch_size(batch_size)
+        try:
+            pending = self.db.get_pending_measurements(limit=limit)
         except Exception as e:
             logger.error("get_pending_measurements failed: %s", e, exc_info=True)
             return ForwardResult(attempted=0, forwarded=0, error=str(e))
@@ -299,11 +392,12 @@ class ForwardWorker:
             return ForwardResult(attempted=0, forwarded=0)
 
         points = [self._to_point(m) for m in pending]
-        day = pending[0].ts[:10]
         ids = [m.id for m in pending]
+        days = sorted({m.ts[:10] for m in pending})
+        coalesced_n = len(_coalesce_points_by_timestamp(points))
 
         try:
-            self.forwarder.send(asset=self.asset, day=day, points=points)
+            self.forwarder.send(asset=self.asset, day=days[0], points=points)
         except Exception as e:
             err = str(e)
             try:
@@ -329,7 +423,18 @@ class ForwardWorker:
                 level="info",
                 component="forwarder",
                 message="forwarded_batch",
-                details={"count": len(ids), "day": day},
+                details={
+                    "count": len(ids),
+                    "days": days,
+                    "ingest_timestamps": coalesced_n,
+                    "batch_limit": limit,
+                },
+            )
+            logger.info(
+                "Forwarded %d measurements (%d timestamps, days=%s) via one gRPC stream",
+                len(ids),
+                coalesced_n,
+                ",".join(days),
             )
         except Exception as e:
             err = f"post_send_sqlite_failed:{e}"
@@ -344,22 +449,80 @@ class ForwardWorker:
                     level="error",
                     component="forwarder",
                     message="mark_forwarded_failed_after_send",
-                    details={"count": len(ids), "day": day, "error": str(e)},
+                    details={"count": len(ids), "days": days, "error": str(e)},
                 )
             except Exception:
                 pass
             return ForwardResult(attempted=len(ids), forwarded=len(ids), error=err)
         return ForwardResult(attempted=len(ids), forwarded=len(ids))
 
+    def run_catchup(
+        self,
+        *,
+        max_batches: Optional[int] = None,
+        max_seconds: Optional[float] = None,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Drain pending rows using large batches and one gRPC stream per batch.
+
+        Intended for manual/operator use; the background loop enters the same mode
+        automatically when the queue exceeds FORWARD_CATCHUP_THRESHOLD.
+        """
+        max_batches = max_batches if max_batches is not None else _env_int("FORWARD_CATCHUP_MAX_BATCHES", 0)
+        max_seconds = (
+            float(max_seconds)
+            if max_seconds is not None
+            else float(_env_int("FORWARD_CATCHUP_MAX_SECONDS", 0))
+        )
+        deadline = time.monotonic() + max_seconds if max_seconds > 0 else None
+        batches = 0
+        forwarded = 0
+        last_error: Optional[str] = None
+
+        while max_batches == 0 or batches < max_batches:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            res = self.run_once(batch_size=batch_size or _env_int("FORWARD_CATCHUP_BATCH_SIZE", 10000))
+            if res.attempted == 0:
+                break
+            batches += 1
+            forwarded += res.forwarded
+            if res.error:
+                last_error = res.error
+                break
+
+        try:
+            pending_remaining = self.db.counts()["pending_forward"]
+        except Exception:
+            pending_remaining = -1
+
+        return {
+            "batches": batches,
+            "forwarded": forwarded,
+            "pending_remaining": pending_remaining,
+            "error": last_error,
+        }
+
     def _to_point(self, m: PendingMeasurement) -> Dict:
         return {"ts": m.ts, "channel": m.channel, "value": m.value}
 
 
 class BackgroundForwardLoop:
-    def __init__(self, *, worker: ForwardWorker, interval_seconds: int = 30):
+    def __init__(
+        self,
+        *,
+        worker: ForwardWorker,
+        db: EdgeDB,
+        interval_seconds: int = 30,
+    ):
         self.worker = worker
+        self.db = db
         self.interval_seconds = interval_seconds
+        self.catchup_interval_seconds = _env_int("FORWARD_CATCHUP_INTERVAL_SECONDS", 0)
+        self.catchup_threshold = _env_int("FORWARD_CATCHUP_THRESHOLD", 2000)
         self._stop = threading.Event()
+        self._in_catchup = False
 
     def start(self) -> None:
         t = threading.Thread(target=self._run, daemon=True)
@@ -368,9 +531,30 @@ class BackgroundForwardLoop:
     def stop(self) -> None:
         self._stop.set()
 
+    def _pending_count(self) -> int:
+        try:
+            return self.db.counts()["pending_forward"]
+        except Exception:
+            return 0
+
+    def _sleep_seconds(self) -> int:
+        if self._pending_count() >= self.catchup_threshold:
+            return self.catchup_interval_seconds
+        return self.interval_seconds
+
     def _run(self) -> None:
-        while not self._stop.wait(self.interval_seconds):
+        while not self._stop.wait(self._sleep_seconds()):
             try:
+                pending_before = self._pending_count()
+                in_catchup = pending_before >= self.catchup_threshold
+                if in_catchup and not self._in_catchup:
+                    logger.info(
+                        "Forward catch-up mode: pending=%d (batch up to %d, interval %ds)",
+                        pending_before,
+                        forward_batch_size_for_pending(pending_before),
+                        self.catchup_interval_seconds,
+                    )
+                self._in_catchup = in_catchup
                 self.worker.run_once()
             except Exception:
                 logger.error("BackgroundForwardLoop tick failed", exc_info=True)

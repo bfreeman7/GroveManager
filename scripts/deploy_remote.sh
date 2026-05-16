@@ -208,6 +208,8 @@ ssh -t "${TARGET}" "bash -lc '
 [Unit]
 Description=OrchardMonitor - measurements and Open Sprinkler schedule
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -218,8 +220,6 @@ LimitNOFILE=65535
 ExecStart=${REMOTE_DIR}/venv/bin/python src/server.py
 Restart=always
 RestartSec=10
-StartLimitBurst=5
-StartLimitIntervalSec=120
 
 [Install]
 WantedBy=multi-user.target
@@ -262,6 +262,8 @@ EOF
 [Unit]
 Description=Grove UI (static) for OrchardMonitor
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -274,8 +276,6 @@ EnvironmentFile=-${ENV_FILE}
 ExecStart=${REMOTE_DIR}/venv/bin/python src/ui_server.py --dir ${REMOTE_DIR}/.deploy/ui-dist --host 0.0.0.0 --port 5173
 Restart=always
 RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=120
 
 [Install]
 WantedBy=multi-user.target

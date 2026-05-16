@@ -5,7 +5,6 @@ Fetches schedule from Open Sprinkler /jp endpoint and appends to schedule_log.js
 Can be run on a 12-hour timer or triggered immediately (e.g. after a schedule update).
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -16,6 +15,8 @@ from typing import Optional
 
 import requests
 
+from libs.opensprinkler_client import resolve_opensprinkler_pw_hash
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,19 +26,21 @@ class ScheduleLogger:
     def __init__(
         self,
         base_url: str,
-        password: str,
+        password: str = "",
+        password_md5: str = "",
         base_path: str = "data",
         log_file: str = "schedule_log.jsonl",
     ):
         """
         Args:
             base_url: Open Sprinkler base URL (e.g. http://192.168.1.x:8080)
-            password: Plain-text password (will be MD5 hashed for API)
+            password: Plain-text password (MD5 hashed for API), or use password_md5
+            password_md5: Pre-computed MD5 hex (OPENSPRINKLER_PW_MD5)
             base_path: Data directory
             log_file: Filename for schedule log (inside base_path)
         """
         self.base_url = base_url.rstrip("/")
-        self._pw_hash = hashlib.md5(password.encode()).hexdigest()
+        self._pw_hash = resolve_opensprinkler_pw_hash(password=password, password_md5=password_md5)
         self.log_path = os.path.join(base_path, log_file)
         os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
         self._stop = threading.Event()

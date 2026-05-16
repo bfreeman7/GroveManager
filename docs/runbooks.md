@@ -22,6 +22,8 @@ Copy/paste reference for **local test/run**, **checking status**, and **deploy**
 curl -sS http://127.0.0.1:8080/health  | python3 -m json.tool
 curl -sS http://127.0.0.1:8080/status  | python3 -m json.tool
 curl -sS -X POST http://127.0.0.1:8080/admin/forward/run-once | python3 -m json.tool
+# Large backlog: one big gRPC stream per batch (optional batch_size query param)
+curl -sS -X POST "http://127.0.0.1:8080/admin/forward/catchup?max_seconds=0" | python3 -m json.tool
 ```
 
 ### Operator UI (optional, local dev)

@@ -55,14 +55,20 @@ The normalized SQLite table is what drives forwarding; Parquet is a “bulk log�
 
 Forwarding happens in either mode:
 
-- **Automatic**: the background loop wakes up on `FORWARD_INTERVAL_SECONDS`.
-- **Manual**: call `POST /admin/forward/run-once` to force an immediate attempt.
+- **Automatic**: the background loop wakes up on `FORWARD_INTERVAL_SECONDS`. When
+  `pending_forward` exceeds `FORWARD_CATCHUP_THRESHOLD`, it switches to catch-up mode:
+  larger batches (`FORWARD_CATCHUP_BATCH_SIZE`), one gRPC stream per batch, and
+  `FORWARD_CATCHUP_INTERVAL_SECONDS` between attempts (often `0` = back-to-back).
+- **Manual**: `POST /admin/forward/run-once` (optional `?batch_size=`), or
+  `POST /admin/forward/catchup` to drain until idle or limits.
 
 When a forward attempt runs:
 
-1. `ForwardWorker` selects up to `batch_size` pending measurement rows.
-2. It converts each row to a point: `{ts, channel, value}`.
-3. It sends the batch via the configured forwarder:
+1. `ForwardWorker` selects up to `batch_size` pending measurement rows (500 steady,
+   up to `FORWARD_CATCHUP_BATCH_SIZE` when the queue is deep).
+2. It converts each row to a point: `{ts, channel, value}`, coalesces rows that share
+   a timestamp (one Ecowitt reading → one gRPC ingest), and splits by UTC day for Sift runs.
+3. It sends the batch via the configured forwarder (single streaming gRPC session per batch):
    - `SIFT_MODE=fake`: write JSONL to `FAKE_SIFT_OUT` (offline validation)
    - `SIFT_MODE=sdk`: send to Sift (see next section)
 4. On success: marks the rows forwarded.
