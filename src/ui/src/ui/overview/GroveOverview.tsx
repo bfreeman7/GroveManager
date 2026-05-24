@@ -22,7 +22,7 @@ export function GroveOverview({
   osError,
 }: Props) {
   return (
-    <div className="overviewStrip overviewStrip--sticky card">
+    <div className="overviewStrip card">
       <h2 className="sectionTitle">Overview</h2>
 
       <SiftCard assetName={status?.sift_asset} />

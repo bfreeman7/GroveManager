@@ -38,33 +38,49 @@ export function TimingTable({ columns, rows, emptyMessage = "No data." }: Props)
   }
 
   return (
-    <div className="timingTableWrap">
-      <table className="timingTable">
-        <thead>
-          <tr>
-            <th scope="col" className="timingTableLabelCol">
-              Station
-            </th>
-            {columns.map((c) => (
-              <th scope="col" key={c.key}>
-                {c.header}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={row.key}>
-              <th scope="row" className="timingTableStation">
-                {row.label}
+    <>
+      <div className="timingTableWrap timingTableWrap--desktop">
+        <table className="timingTable">
+          <thead>
+            <tr>
+              <th scope="col" className="timingTableLabelCol">
+                Station
               </th>
               {columns.map((c) => (
-                <td key={c.key}>{renderCell(row.cells[c.key] ?? "—")}</td>
+                <th scope="col" key={c.key}>
+                  {c.header}
+                </th>
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.key}>
+                <th scope="row" className="timingTableStation">
+                  {row.label}
+                </th>
+                {columns.map((c) => (
+                  <td key={c.key}>{renderCell(row.cells[c.key] ?? "—")}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="timingMobileList">
+        {rows.map((row) => (
+          <article className="timingMobileCard" key={row.key}>
+            <h4 className="timingMobileCardTitle">{row.label}</h4>
+            {columns.map((c) => (
+              <div className="timingMobileRow" key={c.key}>
+                <div className="timingMobileRowLabel">{c.header}</div>
+                <div className="timingMobileRowValue">{renderCell(row.cells[c.key] ?? "—")}</div>
+              </div>
+            ))}
+          </article>
+        ))}
+      </div>
+    </>
   );
 }

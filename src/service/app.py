@@ -10,6 +10,7 @@ from flask import Flask, Response, request
 
 from libs.edge_db import EdgeDB
 from libs.forwarder import BackgroundForwardLoop, FakeSiftForwarder, ForwardWorker, SiftSDKForwarder
+from libs.irrigation_sync import make_irrigation_sync_loop
 from libs.measurement_store import MeasurementStore
 from libs.opensprinkler_client import (
     OpenSprinklerClient,
@@ -119,6 +120,7 @@ def create_app() -> Flask:
 
     schedule_logger: Optional[ScheduleLogger] = None
     opensprinkler_client: Optional[OpenSprinklerClient] = None
+    irrigation_sync_loop = None
     if opensprinkler_url and (opensprinkler_password or opensprinkler_pw_md5):
         opensprinkler_client = OpenSprinklerClient(
             base_url=opensprinkler_url,
@@ -131,6 +133,7 @@ def create_app() -> Flask:
             password_md5=opensprinkler_pw_md5,
             base_path=data_path,
         )
+        irrigation_sync_loop = make_irrigation_sync_loop(client=opensprinkler_client, db=edge_db)
     else:
         logger.warning("OPENSPRINKLER_URL/PASSWORD not set - schedule logging disabled")
 
@@ -336,6 +339,8 @@ def create_app() -> Flask:
                 "result": code,
                 "response": resp,
             }, 400
+        if irrigation_sync_loop:
+            irrigation_sync_loop.sync_once()
         return {"result": code, "response": resp}, 200
 
     @app.route("/integrations/opensprinkler/log", methods=["GET"])
@@ -408,6 +413,7 @@ def create_app() -> Flask:
         "schedule_logger": schedule_logger,
         "opensprinkler_client": opensprinkler_client,
         "forward_loop": forward_loop,
+        "irrigation_sync_loop": irrigation_sync_loop,
     }
 
     return app
@@ -428,4 +434,8 @@ def start_background(app: Flask) -> None:
     forward_loop = ext.get("forward_loop")
     if forward_loop:
         forward_loop.start()
+
+    irrigation_sync_loop = ext.get("irrigation_sync_loop")
+    if irrigation_sync_loop:
+        irrigation_sync_loop.start()
 

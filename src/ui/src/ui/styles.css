@@ -199,6 +199,51 @@
   background: #fff;
 }
 
+.timingMobileList {
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.timingMobileCard {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 12px;
+  background: #fff;
+}
+
+.timingMobileCardTitle {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.timingMobileRow {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px 12px;
+  padding: 8px 0;
+  border-top: 1px solid #f1f5f9;
+}
+
+.timingMobileRow:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.timingMobileRowLabel {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #64748b;
+}
+
+.timingMobileRowValue {
+  min-width: 0;
+}
+
 .timingTable {
   width: 100%;
   border-collapse: collapse;
@@ -888,6 +933,14 @@
     grid-template-columns: 1fr;
     gap: 4px;
   }
+
+  .timingTableWrap--desktop {
+    display: none;
+  }
+
+  .timingMobileList {
+    display: flex;
+  }
 }
 
 @media (min-width: 640px) {
@@ -902,15 +955,5 @@
   }
 }
 
-@media (max-width: 767px) {
-  .overviewStrip--sticky {
-    position: sticky;
-    top: 0;
-    z-index: 10;
-    background: #f8fafc;
-    padding-bottom: 8px;
-    margin: -4px -4px 4px;
-    padding-top: 4px;
-  }
-}
+/* Sticky overview removed on mobile — it hid content below the fold and tables already scroll. */
 

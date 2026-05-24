@@ -99,6 +99,24 @@ class EdgeDB:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS irrigation_station_state (
+                  station_id INTEGER PRIMARY KEY,
+                  is_on INTEGER NOT NULL,
+                  updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS irrigation_run_synced (
+                  station_id INTEGER NOT NULL,
+                  end_epoch INTEGER NOT NULL,
+                  PRIMARY KEY (station_id, end_epoch)
+                )
+                """
+            )
             conn.commit()
 
     def add_system_event(
@@ -237,4 +255,83 @@ class EdgeDB:
                     }
                 )
             return out
+
+    def get_irrigation_station_states(self) -> Dict[int, bool]:
+        with self._lock, self._conn() as conn:
+            cur = conn.execute("SELECT station_id, is_on FROM irrigation_station_state")
+            return {int(row[0]): bool(row[1]) for row in cur.fetchall()}
+
+    def upsert_irrigation_station_state(
+        self,
+        station_id: int,
+        on: bool,
+        *,
+        updated_at: Optional[datetime] = None,
+    ) -> None:
+        updated_at = updated_at or _utc_now()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO irrigation_station_state (station_id, is_on, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(station_id) DO UPDATE SET
+                  is_on = excluded.is_on,
+                  updated_at = excluded.updated_at
+                """,
+                (int(station_id), 1 if on else 0, _iso(updated_at)),
+            )
+            conn.commit()
+
+    def is_run_synced(self, station_id: int, end_epoch: int) -> bool:
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM irrigation_run_synced
+                WHERE station_id = ? AND end_epoch = ?
+                """,
+                (int(station_id), int(end_epoch)),
+            ).fetchone()
+            return row is not None
+
+    def mark_run_synced(self, station_id: int, end_epoch: int) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO irrigation_run_synced (station_id, end_epoch)
+                VALUES (?, ?)
+                """,
+                (int(station_id), int(end_epoch)),
+            )
+            conn.commit()
+
+    def insert_irrigation_points(
+        self,
+        *,
+        points: Iterable[Tuple[datetime, str, bool]],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        point_list = list(points)
+        if not point_list:
+            return 0
+
+        received_at = _utc_now()
+        raw_event_id = self.insert_raw_event(
+            source="irrigation_sync",
+            payload=payload or {"points": len(point_list)},
+            received_at=received_at,
+        )
+
+        by_ts: Dict[str, List[Tuple[str, float]]] = {}
+        for ts, channel, value in point_list:
+            by_ts.setdefault(_iso(ts), []).append((channel, 1.0 if value else 0.0))
+
+        count = 0
+        for ts_iso, channel_values in by_ts.items():
+            ts_dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+            count += self.insert_measurements(
+                raw_event_id=raw_event_id,
+                ts=ts_dt,
+                channel_values=channel_values,
+            )
+        return count
 

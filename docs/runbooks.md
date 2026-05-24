@@ -147,6 +147,70 @@ sudo journalctl -u orchardmonitor -f
 sudo journalctl -u orchardmonitor-ui -f
 ```
 
+### View logs
+
+```bash
+sudo journalctl -u orchardmonitor -f
+sudo journalctl -u orchardmonitor-ui -f
+```
+
+Look for irrigation sync lines after restart:
+
+- `Irrigation sync background task started`
+- `Irrigation snapshot sync queued N point(s) (M on)` — periodic state poll (all stations each tick)
+- `Irrigation startup history sync queued …` — backfilled recent runs from Open Sprinkler `/jl`
+- `Forwarded … measurements` — includes irrigation rows once queued
+
+In Sift, look for hashed flow names on asset **`orchard_weather_station`**. Irrigation uses client key **`orchard-edge-v1.irrigation-state`** and channels **`irrigation_state.station01`–`station08`** (flow hash e.g. **`ba6462925d628aee`** for all 8). Ecowitt stays on **`orchard-edge-v1.ch13`**. Ignore legacy `irrigation.station*` channels and old flow hashes from earlier configs.
+
+If forward fails with `StatusCode.ALREADY_EXISTS`, set a stable ingestion client key matching the ecowitt config already on the Pi:
+
+```bash
+# In /etc/orchardmonitor.env — must match the client_key Sift already has for ecowitt
+SIFT_INGESTION_CLIENT_KEY=orchard-edge-v1.ch13
+```
+
+Then redeploy/restart and retry `POST /admin/forward/run-once`.
+
+### Irrigation → Sift diagnostics (Pi)
+
+```bash
+# Queue depth (should drop after forward runs)
+curl -sS http://127.0.0.1:8080/status | python3 -m json.tool
+
+# Pending irrigation rows in SQLite
+sqlite3 /home/bfree/Repos/GroveManager/data/edge.db \
+  "SELECT channel, value, ts, forwarded_at FROM measurements WHERE channel LIKE 'irrigation_state.%' ORDER BY id DESC LIMIT 20;"
+
+# Known station state from the poller
+sqlite3 /home/bfree/Repos/GroveManager/data/edge.db \
+  "SELECT station_id, is_on, updated_at FROM irrigation_station_state ORDER BY station_id;"
+
+# Force a forward attempt now
+curl -sS -X POST http://127.0.0.1:8080/admin/forward/run-once | python3 -m json.tool
+```
+
+If `pending_forward` stays at 0 and SQLite has no `irrigation_state.%` rows:
+
+1. Confirm the sync loop is running — look for `Irrigation snapshot sync queued` every ~15s in logs.
+2. Open Sprinkler run logging may be off — enable it in the Sprinkler section (`options.lg=1`) so startup/history backfill has `/jl` data.
+3. After deploy, wait for startup history backfill (immediate) or run a station; periodic history runs every 5 minutes by default.
+
+**Sift ingest tracing** — set `SIFT_INGEST_LOG=1` in `/etc/orchardmonitor.env` and restart. Logs include flow registration (`CreateIngestionConfigFlows`), channel order from Sift (`ListIngestionConfigFlows`), and sample ingest payloads (`IngestWithConfigDataStream`) with indexed channel names:
+
+```bash
+sudo journalctl -u orchardmonitor -f | grep -E "Sift |sift_py |sift_client "
+```
+
+Tune volume with `SIFT_INGEST_LOG_SAMPLE_N=3` (rows logged per flow per forward batch).
+
+Adjust backfill windows in `/etc/orchardmonitor.env`:
+
+- `IRRIGATION_HISTORY_STARTUP_LOOKBACK_HOURS=24` — runs ingested on service start
+- `IRRIGATION_HISTORY_LOOKBACK_MINUTES=5` — periodic `/jl` sync window
+
+Then `sudo systemctl restart orchardmonitor`.
+
 ### Health from the Pi
 
 ```bash

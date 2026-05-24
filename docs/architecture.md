@@ -34,6 +34,7 @@ Each `/ecowitt` POST produces:
 - **Raw event** (SQLite): the original form payload, stored as JSON for replay/debug.
 - **Normalized measurements** (SQLite): a list of numeric channel/value points:
   - Channel naming convention: `ecowitt.<key>` (e.g. `ecowitt.soilmoisture1`)
+  - Irrigation channels: `irrigation_state.stationNN` (`true`/`false` as Sift `BOOL`), from Open Sprinkler sync
   - Value: float (non-numeric values are currently skipped for forwarding)
 - **Bulk record** (Parquet): a row containing the timestamp plus all keys/values from the payload.
 
@@ -76,11 +77,35 @@ When a forward attempt runs:
 
 ## Sift integration (current behavior)
 
-Forwarding uses a single:
+Forwarding uses:
 
 - **asset**: `SIFT_ASSET` / `SIFT_ASSET_NAME`
-- **flow**: `SIFT_FLOW_NAME`
+- **flows**: SHA-256 of the sorted channel names in each family (16 hex chars). One flow for all `irrigation_state.*` channels in the batch; one flow for all `ecowitt.*` channels. If the channel set changes, the hash (and Sift flow) changes automatically.
+- **ingestion configs**: ecowitt uses `SIFT_INGESTION_CLIENT_KEY`; irrigation uses `SIFT_IRRIGATION_INGESTION_CLIENT_KEY` when set (fresh config for `irrigation_state.*`).
+- **ingestion client key**: `SIFT_INGESTION_CLIENT_KEY` (stable; do not vary by batch size)
 - **run naming**: `"<asset>.<YYYY-MM-DD>"` (one run per asset per UTC day)
+
+### Irrigation → Sift
+
+When Open Sprinkler is configured, a background **irrigation sync loop** polls the controller and enqueues on/off measurements into the same SQLite forward queue as Ecowitt data.
+
+- **Channels**: `irrigation_state.station01`, `irrigation_state.station02`, … (1-indexed, zero-padded; Open Sprinkler station id `0` → `station01`)
+- **Values**: `true` = on, `false` = off (Sift `BOOL` channel type)
+- **Live state**: snapshot poll every `IRRIGATION_SYNC_INTERVAL_SECONDS` (default 15s); emits current on/off for every station each tick
+- **History backfill**: optional periodic sync from device `/jl` run log (default every 300s, last 5 minutes); requires run logging enabled on the device (`options.lg = 1`)
+- **Immediate sync**: manual run/stop via `POST /integrations/opensprinkler/station` triggers a snapshot sync without waiting for the next poll
+
+Implementation: `src/libs/irrigation_sync.py`. State tables in SQLite track last-known station on/off and dedupe history backfill.
+
+Controls:
+
+- `IRRIGATION_SYNC_ENABLED=1` (default when Open Sprinkler is configured; set `0` to disable)
+- `IRRIGATION_SYNC_INTERVAL_SECONDS=15`
+- `IRRIGATION_HISTORY_SYNC_INTERVAL_SECONDS=300` (set `0` to disable history backfill)
+- `IRRIGATION_HISTORY_LOOKBACK_MINUTES=5` (periodic backfill window)
+- `IRRIGATION_HISTORY_STARTUP_LOOKBACK_HOURS=24` (one-time backfill on service start)
+
+In Sift, active sprinklers are channels whose latest value is `true`.
 
 ### SDK preference vs fallback
 
