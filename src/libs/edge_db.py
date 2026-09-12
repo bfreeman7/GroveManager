@@ -232,6 +232,18 @@ class EdgeDB:
             total = conn.execute("SELECT COUNT(*) FROM measurements").fetchone()[0]
             return {"pending_forward": int(pending), "total_measurements": int(total)}
 
+    def oldest_pending_ts(self) -> Optional[str]:
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT ts FROM measurements
+                WHERE forwarded_at IS NULL
+                ORDER BY ts ASC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            return str(row[0]) if row else None
+
     def recent_system_events(self, *, limit: int = 50) -> List[Dict[str, Any]]:
         with self._lock, self._conn() as conn:
             cur = conn.execute(

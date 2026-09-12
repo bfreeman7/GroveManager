@@ -6,13 +6,34 @@ export type SystemEvent = {
   details: unknown | null;
 };
 
+export type ForwardHealth = {
+  ok: boolean;
+  degraded: boolean;
+  reason: string | null;
+  pending_forward: number;
+  connectivity_ok?: boolean | null;
+  last_attempt_at: string | null;
+  last_success_at: string | null;
+  last_error_at: string | null;
+  last_error: string | null;
+  consecutive_failures: number;
+  failure_streak_seconds: number | null;
+  total_failures: number;
+  total_successes: number;
+  success_age_seconds: number | null;
+  stale_after_seconds: number;
+  restart_after_seconds: number;
+};
+
 export type StatusResponse = {
   data_path: string;
   edge_db_path: string;
   sift_mode: string;
   sift_asset: string;
   pending_forward: number;
+  oldest_pending_ts?: string | null;
   total_measurements_indexed: number;
+  forward?: ForwardHealth;
   recent_events: SystemEvent[];
 };
 

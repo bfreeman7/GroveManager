@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import json
 import os
+import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -197,6 +199,310 @@ def _env_bool(name: str, default: bool) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return float(raw)
+
+
+def _summarize_forward_error(err: str, *, max_len: int = 180) -> str:
+    """Collapse noisy gRPC UNAVAILABLE blobs into a short, stable key."""
+    text = " ".join((err or "").split())
+    lower = text.lower()
+    if lower.startswith("connectivity_offline"):
+        return text if len(text) <= max_len else text[: max_len - 3] + "..."
+    if "dns" in lower or "hostname lookup" in lower or "address lookup failed" in lower:
+        return "dns_resolve_failed:grpc-api.siftstack.com"
+    if "failed to connect to all addresses" in lower:
+        return "connect_failed:sift_grpc"
+    if "ping timeout" in lower:
+        return "ping_timeout:sift_grpc"
+    if "recvmsg:connection timed out" in lower:
+        return "recv_timeout:sift_grpc"
+    if "unavailable" in lower:
+        return "unavailable:sift_grpc"
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _sift_grpc_hostname() -> str:
+    raw = (
+        os.getenv("SIFT_GRPC_URL")
+        or os.getenv("SIFT_GRPC_URI")
+        or os.getenv("SIFT_GRPC")
+        or "grpc-api.siftstack.com"
+    ).strip()
+    if "://" in raw:
+        host = urlparse(raw).hostname or ""
+        return host or "grpc-api.siftstack.com"
+    # host or host:port
+    return raw.split(":")[0] or "grpc-api.siftstack.com"
+
+
+def probe_sift_connectivity(*, timeout_seconds: Optional[float] = None) -> bool:
+    """
+    Cheap reachability check: DNS resolve of the Sift gRPC host.
+
+    Used to detect internet/DNS restoration without hanging on a full gRPC attempt.
+    """
+    if timeout_seconds is None:
+        timeout_seconds = _env_float("FORWARD_CONNECTIVITY_PROBE_TIMEOUT_SECONDS", 3.0)
+    host = _sift_grpc_hostname()
+    if not host:
+        return False
+
+    def _resolve() -> None:
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_resolve)
+            fut.result(timeout=max(0.5, float(timeout_seconds)))
+        return True
+    except Exception:
+        return False
+
+
+def is_connectivity_error(summary: str) -> bool:
+    s = (summary or "").lower()
+    return (
+        s.startswith("connectivity_offline")
+        or "dns_resolve_failed" in s
+        or "connect_failed" in s
+        or "recv_timeout" in s
+        or "ping_timeout" in s
+    )
+
+
+class ForwardSyncHealth:
+    """
+    In-process forwarder health for /health, logging, backoff, and self-restart.
+
+    Persist nothing here — sqlite system_events remain the durable trail, but we
+    rate-limit how often identical failures are written.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.last_attempt_at: Optional[datetime] = None
+        self.last_success_at: Optional[datetime] = None
+        self.last_error_at: Optional[datetime] = None
+        self.first_failure_at: Optional[datetime] = None
+        self.last_error_summary: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.total_failures: int = 0
+        self.total_successes: int = 0
+        self._last_event_error_key: Optional[str] = None
+        self._last_event_at: Optional[datetime] = None
+        self._last_row_error_key: Optional[str] = None
+        self.restart_requested: bool = False
+        self.connectivity_ok: Optional[bool] = None
+
+    def note_connectivity(self, online: bool) -> Optional[str]:
+        """
+        Update connectivity flag. Returns 'restored' | 'lost' | None when unchanged/first sighting.
+        """
+        with self._lock:
+            prev = self.connectivity_ok
+            self.connectivity_ok = online
+        if prev is False and online:
+            return "restored"
+        if prev is True and not online:
+            return "lost"
+        return None
+
+    def note_connectivity_restored(self) -> None:
+        """Soft-reset backoff after the network comes back so we retry immediately."""
+        with self._lock:
+            self.consecutive_failures = 0
+            self.first_failure_at = None
+            self.restart_requested = False
+            # Force a fresh system_event if the next send still fails.
+            self._last_event_error_key = None
+            self._last_row_error_key = None
+        logger.info("Connectivity restored — reset forward backoff for immediate retry")
+
+    def record_success(self, *, forwarded: int) -> None:
+        now = _utc_now()
+        with self._lock:
+            self.last_attempt_at = now
+            self.last_success_at = now
+            self.consecutive_failures = 0
+            self.first_failure_at = None
+            self.total_successes += 1
+            self.last_error_summary = None
+            self._last_event_error_key = None
+            self._last_row_error_key = None
+            self.restart_requested = False
+        if forwarded:
+            logger.debug("Forward success recorded (forwarded=%d)", forwarded)
+
+    def record_failure(self, error: str) -> Dict[str, Any]:
+        """
+        Update failure counters.
+
+        Returns flags for the worker:
+        - should_log_event: write a system_events row (rate-limited)
+        - should_mark_rows: update measurements.forward_error (rate-limited)
+        - summary: short error key
+        """
+        now = _utc_now()
+        summary = _summarize_forward_error(error)
+        event_interval = _env_float("FORWARD_ERROR_LOG_INTERVAL_SECONDS", 300.0)
+        with self._lock:
+            self.last_attempt_at = now
+            self.last_error_at = now
+            self.last_error_summary = summary
+            if self.consecutive_failures == 0:
+                self.first_failure_at = now
+            self.consecutive_failures += 1
+            self.total_failures += 1
+            failures = self.consecutive_failures
+
+            should_log_event = (
+                summary != self._last_event_error_key
+                or self._last_event_at is None
+                or (now - self._last_event_at).total_seconds() >= event_interval
+            )
+            if should_log_event:
+                self._last_event_error_key = summary
+                self._last_event_at = now
+
+            should_mark_rows = summary != self._last_row_error_key
+            if should_mark_rows:
+                self._last_row_error_key = summary
+
+        if should_log_event:
+            logger.error(
+                "Forward failed (%dx): %s",
+                failures,
+                summary,
+            )
+            if "dns_resolve" in summary:
+                logger.error(
+                    "Sift DNS failing — Pi resolv.conf may be Tailscale MagicDNS-only; "
+                    "see runbooks (DNS resilience). consecutive_failures=%d",
+                    failures,
+                )
+        else:
+            logger.warning(
+                "Forward still failing (%dx): %s",
+                failures,
+                summary,
+            )
+
+        return {
+            "summary": summary,
+            "should_log_event": should_log_event,
+            "should_mark_rows": should_mark_rows,
+            "consecutive_failures": failures,
+        }
+
+    def snapshot(self, *, pending_forward: int = 0) -> Dict[str, Any]:
+        stale_after = _env_float("FORWARD_STALE_SECONDS", 1800.0)
+        restart_after = _env_float("FORWARD_RESTART_AFTER_SECONDS", 3600.0)
+        with self._lock:
+            last_success = self.last_success_at
+            last_attempt = self.last_attempt_at
+            last_error_at = self.last_error_at
+            last_error = self.last_error_summary
+            consecutive = self.consecutive_failures
+            total_fail = self.total_failures
+            total_ok = self.total_successes
+            first_failure = self.first_failure_at
+            connectivity_ok = self.connectivity_ok
+
+        success_age: Optional[float] = None
+        if last_success is not None:
+            success_age = max(0.0, (_utc_now() - last_success).total_seconds())
+
+        streak: Optional[float] = None
+        if consecutive > 0 and first_failure is not None:
+            streak = max(0.0, (_utc_now() - first_failure).total_seconds())
+
+        degraded = False
+        reason: Optional[str] = None
+        if pending_forward > 0 and consecutive > 0:
+            success_stale = (
+                last_success is not None
+                and success_age is not None
+                and success_age >= stale_after
+            )
+            streak_stale = streak is not None and streak >= stale_after
+            if success_stale or streak_stale:
+                degraded = True
+                if connectivity_ok is False:
+                    reason = "connectivity_offline"
+                else:
+                    reason = "forward_stale" if last_success is not None else "forward_failing"
+
+        return {
+            "ok": not degraded,
+            "degraded": degraded,
+            "reason": reason,
+            "pending_forward": pending_forward,
+            "connectivity_ok": connectivity_ok,
+            "last_attempt_at": _iso(last_attempt) if last_attempt else None,
+            "last_success_at": _iso(last_success) if last_success else None,
+            "last_error_at": _iso(last_error_at) if last_error_at else None,
+            "last_error": last_error,
+            "consecutive_failures": consecutive,
+            "failure_streak_seconds": int(streak) if streak is not None else None,
+            "total_failures": total_fail,
+            "total_successes": total_ok,
+            "success_age_seconds": int(success_age) if success_age is not None else None,
+            "stale_after_seconds": int(stale_after),
+            "restart_after_seconds": int(restart_after),
+        }
+
+    def failure_streak_seconds(self) -> Optional[float]:
+        with self._lock:
+            if self.consecutive_failures <= 0 or self.first_failure_at is None:
+                return None
+            return max(0.0, (_utc_now() - self.first_failure_at).total_seconds())
+
+    def should_restart(self, *, pending_forward: int, connectivity_ok: bool = True) -> bool:
+        """
+        Exit the process so systemd Restart=always can clear stuck gRPC/DNS client state.
+
+        Does not restart while the network probe says we are offline — that cannot help
+        until internet/DNS returns.
+        """
+        if not _env_bool("FORWARD_WATCHDOG_ENABLED", True):
+            return False
+        if not connectivity_ok:
+            return False
+        if pending_forward <= 0:
+            return False
+        # Prefer restart when online but still failing (stuck client), not during outages.
+        with self._lock:
+            err = self.last_error_summary or ""
+        if is_connectivity_error(err) and self.connectivity_ok is False:
+            return False
+        restart_after = _env_float("FORWARD_RESTART_AFTER_SECONDS", 3600.0)
+        streak = self.failure_streak_seconds()
+        if streak is None or streak < restart_after:
+            return False
+        with self._lock:
+            if self.restart_requested:
+                return False
+            self.restart_requested = True
+            return True
+
+    def backoff_seconds(self, base_interval: int) -> int:
+        """Exponential backoff while failing; capped. Success path uses base_interval."""
+        max_backoff = int(_env_float("FORWARD_BACKOFF_MAX_SECONDS", 300.0))
+        with self._lock:
+            failures = self.consecutive_failures
+        if failures <= 0:
+            return base_interval
+        # 30, 60, 120, 240, ... up to max
+        delay = min(max_backoff, int(base_interval * (2 ** min(failures - 1, 6))))
+        return max(base_interval, delay)
 
 
 def _sift_ingest_log_enabled() -> bool:
@@ -548,6 +854,10 @@ class MeasurementForwarder:
     def send(self, *, asset: str, day: str, points: List[Dict]) -> None:
         raise NotImplementedError()
 
+    def reset_transport(self) -> None:
+        """Drop cached clients/channels so the next send reconnects cleanly."""
+        return
+
 
 class FakeSiftForwarder(MeasurementForwarder):
     """
@@ -606,6 +916,19 @@ class SiftSDKForwarder(MeasurementForwarder):
         self.ingest_log_sample_n = _sift_ingest_log_sample_n()
         # After sift_client TLS/connect failures on this host, stick to sift_py for the process.
         self._use_sift_py_only = self.prefer_client == "py"
+
+    def reset_transport(self) -> None:
+        with self._sift_client_lock:
+            client = self._sift_client
+            self._sift_client = None
+        if client is not None:
+            logger.info("Reset Sift gRPC client after connectivity change")
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("SiftClient.close failed during reset", exc_info=True)
 
     def _sift_client_grpc_url(self) -> str:
         grpc_u = self.grpc_url
@@ -991,11 +1314,13 @@ class ForwardWorker:
         forwarder: MeasurementForwarder,
         asset: str,
         batch_size: Optional[int] = None,
+        health: Optional[ForwardSyncHealth] = None,
     ):
         self.db = db
         self.forwarder = forwarder
         self.asset = asset
         self.batch_size = batch_size or _env_int("FORWARD_BATCH_SIZE", 500)
+        self.health = health or ForwardSyncHealth()
 
     def _resolve_batch_size(self, override: Optional[int] = None) -> int:
         if override is not None:
@@ -1012,9 +1337,12 @@ class ForwardWorker:
             pending = self.db.get_pending_measurements(limit=limit)
         except Exception as e:
             logger.error("get_pending_measurements failed: %s", e, exc_info=True)
+            self.health.record_failure(str(e))
             return ForwardResult(attempted=0, forwarded=0, error=str(e))
 
         if not pending:
+            # Empty queue counts as healthy forward path.
+            self.health.record_success(forwarded=0)
             return ForwardResult(attempted=0, forwarded=0)
 
         points = [self._to_point(m) for m in pending]
@@ -1026,14 +1354,22 @@ class ForwardWorker:
             self.forwarder.send(asset=self.asset, day=days[0], points=points)
         except Exception as e:
             err = str(e)
+            flags = self.health.record_failure(err)
             try:
-                self.db.mark_forward_error(ids, err)
-                self.db.add_system_event(
-                    level="error",
-                    component="forwarder",
-                    message="forward_failed",
-                    details={"count": len(ids), "error": err},
-                )
+                if flags["should_mark_rows"]:
+                    self.db.mark_forward_error(ids, flags["summary"])
+                if flags["should_log_event"]:
+                    self.db.add_system_event(
+                        level="error",
+                        component="forwarder",
+                        message="forward_failed",
+                        details={
+                            "count": len(ids),
+                            "error": flags["summary"],
+                            "consecutive_failures": flags["consecutive_failures"],
+                            "error_detail": err[:500],
+                        },
+                    )
             except Exception as inner:
                 logger.error(
                     "forward_failed and could not persist error to sqlite: %s (original: %s)",
@@ -1062,6 +1398,7 @@ class ForwardWorker:
                 coalesced_n,
                 ",".join(days),
             )
+            self.health.record_success(forwarded=len(ids))
         except Exception as e:
             err = f"post_send_sqlite_failed:{e}"
             logger.critical(
@@ -1070,6 +1407,7 @@ class ForwardWorker:
                 e,
                 exc_info=True,
             )
+            self.health.record_failure(err)
             try:
                 self.db.add_system_event(
                     level="error",
@@ -1149,9 +1487,10 @@ class BackgroundForwardLoop:
         self.catchup_threshold = _env_int("FORWARD_CATCHUP_THRESHOLD", 2000)
         self._stop = threading.Event()
         self._in_catchup = False
+        self._force_immediate = False
 
     def start(self) -> None:
-        t = threading.Thread(target=self._run, daemon=True)
+        t = threading.Thread(target=self._run, daemon=True, name="forward-loop")
         t.start()
 
     def stop(self) -> None:
@@ -1164,15 +1503,115 @@ class BackgroundForwardLoop:
             return 0
 
     def _sleep_seconds(self) -> int:
-        if self._pending_count() >= self.catchup_threshold:
+        if self._force_immediate:
+            self._force_immediate = False
+            return 0
+        pending = self._pending_count()
+        if self.worker.health.consecutive_failures > 0:
+            return self.worker.health.backoff_seconds(self.interval_seconds)
+        if pending >= self.catchup_threshold:
             return self.catchup_interval_seconds
         return self.interval_seconds
+
+    def _probe_enabled(self) -> bool:
+        return _env_bool("FORWARD_CONNECTIVITY_PROBE", True)
+
+    def _check_connectivity(self) -> bool:
+        if not self._probe_enabled():
+            return True
+        # Fake/local forwarders do not need public DNS.
+        if not isinstance(self.worker.forwarder, SiftSDKForwarder):
+            return True
+        return probe_sift_connectivity()
+
+    def _handle_connectivity(self, online: bool, *, pending: int) -> bool:
+        """
+        Update health from probe. Returns True if the tick should attempt a Sift send.
+        """
+        transition = self.worker.health.note_connectivity(online)
+        if transition == "lost":
+            logger.warning(
+                "Sift host unreachable (DNS/network) — pausing gRPC sends until connectivity returns"
+            )
+            try:
+                self.db.add_system_event(
+                    level="warning",
+                    component="forwarder",
+                    message="connectivity_lost",
+                    details={"host": _sift_grpc_hostname(), "pending_forward": pending},
+                )
+            except Exception:
+                pass
+        elif transition == "restored":
+            logger.info(
+                "Sift host reachable again — resetting transport and retrying pending=%d",
+                pending,
+            )
+            self.worker.health.note_connectivity_restored()
+            try:
+                self.worker.forwarder.reset_transport()
+            except Exception:
+                logger.warning("reset_transport failed", exc_info=True)
+            try:
+                self.db.add_system_event(
+                    level="info",
+                    component="forwarder",
+                    message="connectivity_restored",
+                    details={"host": _sift_grpc_hostname(), "pending_forward": pending},
+                )
+            except Exception:
+                pass
+            self._force_immediate = True
+
+        if online:
+            return True
+
+        # Offline: record a compact failure without hanging on gRPC/DNS.
+        if pending > 0:
+            self.worker.health.record_failure("connectivity_offline:sift_dns")
+        return False
+
+    def _maybe_watchdog_exit(self, pending: int, *, connectivity_ok: bool) -> None:
+        if not self.worker.health.should_restart(
+            pending_forward=pending, connectivity_ok=connectivity_ok
+        ):
+            return
+        snap = self.worker.health.snapshot(pending_forward=pending)
+        logger.critical(
+            "Forward watchdog: exiting process after %ss of failures with pending=%d "
+            "(last_error=%s, connectivity_ok=%s). systemd Restart=always should recycle the service.",
+            snap.get("failure_streak_seconds"),
+            pending,
+            snap.get("last_error"),
+            connectivity_ok,
+        )
+        try:
+            self.db.add_system_event(
+                level="error",
+                component="forwarder",
+                message="forward_watchdog_restart",
+                details=snap,
+            )
+        except Exception:
+            pass
+        # Background thread: os._exit so Flask's main thread cannot ignore SystemExit.
+        os._exit(78)
 
     def _run(self) -> None:
         while not self._stop.wait(self._sleep_seconds()):
             try:
                 pending_before = self._pending_count()
-                in_catchup = pending_before >= self.catchup_threshold
+                online = self._check_connectivity()
+                should_send = self._handle_connectivity(online, pending=pending_before)
+
+                if not should_send:
+                    # Stay in backoff; watchdog will not fire while offline.
+                    continue
+
+                in_catchup = (
+                    pending_before >= self.catchup_threshold
+                    and self.worker.health.consecutive_failures == 0
+                )
                 if in_catchup and not self._in_catchup:
                     logger.info(
                         "Forward catch-up mode: pending=%d (batch up to %d, interval %ds)",
@@ -1182,6 +1621,7 @@ class BackgroundForwardLoop:
                     )
                 self._in_catchup = in_catchup
                 self.worker.run_once()
+                self._maybe_watchdog_exit(self._pending_count(), connectivity_ok=online)
             except Exception:
                 logger.error("BackgroundForwardLoop tick failed", exc_info=True)
 

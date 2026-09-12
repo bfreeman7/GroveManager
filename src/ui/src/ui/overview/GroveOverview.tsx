@@ -2,6 +2,7 @@ import React from "react";
 import { SiftCard } from "./SiftCard";
 import { StationTimingTable } from "./StationTimingTable";
 import { SyncStatusTable } from "./SyncStatusTable";
+import { ForwardHealthBanner } from "../shared/ForwardHealthBanner";
 import type { OpenSprinklerLogResponse, OpenSprinklerSnapshotConfigured, StatusResponse } from "../types";
 
 type Props = {
@@ -26,6 +27,8 @@ export function GroveOverview({
       <h2 className="sectionTitle">Overview</h2>
 
       <SiftCard assetName={status?.sift_asset} />
+
+      <ForwardHealthBanner status={status} />
 
       <div className="overviewBlock">
         <h3 className="overviewBlockTitle">Sprinkler schedule</h3>

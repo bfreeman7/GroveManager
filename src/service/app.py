@@ -190,26 +190,39 @@ def create_app() -> Flask:
     def health():
         try:
             counts = edge_db.counts()
+            oldest_pending = edge_db.oldest_pending_ts()
         except Exception as e:
             logger.error("health: edge_db.counts failed: %s", e, exc_info=True)
             return {"status": "unhealthy", "error": str(e)}, 503
-        return {"status": "healthy", "pending_forward": counts["pending_forward"], "sift_mode": sift_mode}, 200
+        forward = forward_worker.health.snapshot(pending_forward=counts["pending_forward"])
+        body = {
+            "status": "degraded" if forward["degraded"] else "healthy",
+            "pending_forward": counts["pending_forward"],
+            "oldest_pending_ts": oldest_pending,
+            "sift_mode": sift_mode,
+            "forward": forward,
+        }
+        return body, (503 if forward["degraded"] else 200)
 
     @app.route("/status", methods=["GET"])
     def status():
         try:
             counts = edge_db.counts()
             events = edge_db.recent_system_events(limit=20)
+            oldest_pending = edge_db.oldest_pending_ts()
         except Exception as e:
             logger.error("status: edge_db query failed: %s", e, exc_info=True)
             return {"error": str(e), "edge_db_path": edge_db_path}, 503
+        forward = forward_worker.health.snapshot(pending_forward=counts["pending_forward"])
         return {
             "data_path": data_path,
             "edge_db_path": edge_db_path,
             "sift_mode": sift_mode,
             "sift_asset": sift_asset,
             "pending_forward": counts["pending_forward"],
+            "oldest_pending_ts": oldest_pending,
             "total_measurements_indexed": counts["total_measurements"],
+            "forward": forward,
             "recent_events": events,
         }, 200
 

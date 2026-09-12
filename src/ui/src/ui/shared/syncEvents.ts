@@ -1,4 +1,5 @@
 import type { SystemEvent } from "../types";
+import { humanizeForwardError } from "./forwardHealth";
 
 export type LastForwardSync = {
   at: Date;
@@ -46,7 +47,15 @@ export function summarizeForwardEvent(e: SystemEvent): string {
     if (n != null) return `Sent ${n} rows`;
     return "Batch sent";
   }
-  if (e.message === "forward_failed") return "Forward failed";
+  if (e.message === "forward_failed") {
+    const d = e.details as { error?: string; consecutive_failures?: number } | null;
+    const err = humanizeForwardError(d?.error);
+    if (d?.consecutive_failures) return `${err} (${d.consecutive_failures}×)`;
+    return err;
+  }
   if (e.message === "mark_forwarded_failed_after_send") return "DB update failed after send";
+  if (e.message === "connectivity_lost") return "Sift network lost — pausing forwards";
+  if (e.message === "connectivity_restored") return "Sift network restored — retrying";
+  if (e.message === "forward_watchdog_restart") return "Watchdog restarting edge service";
   return e.message;
 }

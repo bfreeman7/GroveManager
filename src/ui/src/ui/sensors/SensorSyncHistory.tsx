@@ -24,19 +24,27 @@ export function SensorSyncHistory({ events }: Props) {
   return (
     <>
       <p className="muted compactHint">
-        Recent forward attempts to Sift (newest first). Errors are highlighted; successful batches
-        show how many rows were sent.
+        Recent forward attempts to Sift (newest first). Errors and connectivity changes are
+        highlighted; successful batches show how many rows were sent.
       </p>
       <ul className="compactEventList">
         {filtered.map((e, idx) => {
           const at = new Date(e.ts);
           const rel = Number.isNaN(at.getTime()) ? "" : formatRelativeTime(at);
+          const isError = e.level === "error";
+          const isWarning =
+            e.level === "warning" ||
+            e.message === "connectivity_lost" ||
+            e.message === "connectivity_restored";
+          const pillClass = isError ? "error" : isWarning ? "warning" : e.level;
           return (
             <li
               key={`${e.ts}-${idx}`}
-              className={`compactEvent ${e.level === "error" ? "compactEvent--error" : ""}`}
+              className={`compactEvent ${
+                isError ? "compactEvent--error" : isWarning ? "compactEvent--warning" : ""
+              }`}
             >
-              <span className={`pill ${e.level}`}>{e.level}</span>
+              <span className={`pill ${pillClass}`}>{e.level}</span>
               <span className="compactEventMsg">{summarizeForwardEvent(e)}</span>
               <span className="compactEventWhen" title={e.ts}>
                 {rel}
